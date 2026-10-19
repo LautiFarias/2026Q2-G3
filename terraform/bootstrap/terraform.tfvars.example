@@ -1,0 +1,13 @@
+project     = "accesoseguro"
+environment = "dev"
+region      = "us-east-1"
+
+# Dejar vacío para que se genere solo como accesoseguro-tfstate-<account_id>.
+state_bucket_name = ""
+
+create_dynamodb_lock_table = false
+
+tags = {
+  Materia = "82.08-cloud-computing"
+  Grupo   = "G3"
+}

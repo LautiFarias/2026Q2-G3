@@ -1,0 +1,40 @@
+name: Diagnóstico S3 (temporal)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Sitio estático
+        continue-on-error: true
+        run: |
+          ACC=$(aws sts get-caller-identity --query Account --output text)
+          B="accesoseguro-dev-sitio"
+          run() { if out=$("$@" 2>&1); then echo "OK: ${out:0:600}"; else echo "FALLA: ${out:0:300}"; fi; }
+          {
+            echo "### Sitio $B"
+            echo "- PAB del bucket: $(run aws s3api get-public-access-block --bucket $B --output json | tr -d '\n ')"
+            echo "- PAB de la cuenta: $(run aws s3control get-public-access-block --account-id $ACC --output json | tr -d '\n ')"
+            echo "- Policy: $(run aws s3api get-bucket-policy --bucket $B --query Policy --output text)"
+            echo "- Policy status: $(run aws s3api get-bucket-policy-status --bucket $B --output json | tr -d '\n ')"
+            echo "- Ownership: $(run aws s3api get-bucket-ownership-controls --bucket $B --output json | tr -d '\n ')"
+            echo "- Website: $(run aws s3api get-bucket-website --bucket $B --output json | tr -d '\n ')"
+            echo "- index.html: $(run aws s3api head-object --bucket $B --key index.html --output json | tr -d '\n ')"
+            echo "- Cifrado: $(run aws s3api get-bucket-encryption --bucket $B --output json | tr -d '\n ')"
+            echo "- curl: $(curl -s -o /dev/null -w '%{http_code}' http://$B.s3-website-us-east-1.amazonaws.com/)"
+          } | tee -a "$GITHUB_STEP_SUMMARY"

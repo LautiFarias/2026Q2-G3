@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AccesoSeguro</title>
+  <!-- PLACEHOLDER: reemplazar por el front real. config.js lo genera Terraform. -->
+  <script src="config.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 48px auto; padding: 0 16px; }
+    input { display: block; margin: 8px 0; padding: 6px; width: 100%; box-sizing: border-box; }
+    button { padding: 8px 16px; margin: 4px 4px 4px 0; }
+    pre { background: #f4f4f4; padding: 12px; overflow-x: auto; white-space: pre-wrap; }
+    section { margin-bottom: 24px; }
+  </style>
+</head>
+<body>
+  <h1>AccesoSeguro</h1>
+
+  <!-- Login por Lambda: el navegador llama al ALB (/auth/*) y el ALB reenvía
+       a la Lambda auth-login, que habla con Cognito. Sin API Gateway. -->
+  <section id="auth">
+    <h2>Ingresar / Registrarme</h2>
+    <input id="email" type="email" placeholder="mail">
+    <input id="password" type="password" placeholder="contraseña (mín. 8, mayús./minús./número)">
+    <button id="login">Ingresar</button>
+    <button id="signup">Registrarme (transportista)</button>
+    <div id="confirmacion" style="display:none">
+      <input id="codigo" placeholder="código que te llegó por mail">
+      <button id="confirmar">Confirmar código</button>
+    </div>
+  </section>
+
+  <section id="logueado" style="display:none">
+    <h2>Sesión iniciada</h2>
+    <button id="probar">Probar API (/api/info)</button>
+    <button id="logout">Salir</button>
+  </section>
+
+  <pre id="salida"></pre>
+
+  <script>
+    const cfg = window.APP_CONFIG;
+    const salida = document.getElementById("salida");
+
+    function mostrarSesion(hayToken) {
+      document.getElementById("auth").style.display = hayToken ? "none" : "block";
+      document.getElementById("logueado").style.display = hayToken ? "block" : "none";
+    }
+    mostrarSesion(!!sessionStorage.getItem("id_token"));
+
+    async function auth(ruta, cuerpo) {
+      const r = await fetch(cfg.apiUrl + "/auth/" + ruta, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(cuerpo),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.mensaje || data.error || "error");
+      return data;
+    }
+
+    const valor = (id) => document.getElementById(id).value;
+
+    document.getElementById("signup").onclick = async () => {
+      try {
+        await auth("signup", { email: valor("email"), password: valor("password") });
+        salida.textContent = "Te registraste. Revisá tu mail y confirmá el código.";
+        document.getElementById("confirmacion").style.display = "block";
+      } catch (e) { salida.textContent = e.message; }
+    };
+
+    document.getElementById("confirmar").onclick = async () => {
+      try {
+        await auth("confirm", { email: valor("email"), code: valor("codigo") });
+        salida.textContent = "Confirmado. Un administrador te tiene que asignar la empresa antes de que puedas crear solicitudes.";
+      } catch (e) { salida.textContent = e.message; }
+    };
+
+    document.getElementById("login").onclick = async () => {
+      try {
+        const t = await auth("login", { email: valor("email"), password: valor("password") });
+        sessionStorage.setItem("id_token", t.id_token);
+        mostrarSesion(true);
+        salida.textContent = "Sesión iniciada.";
+      } catch (e) { salida.textContent = e.message; }
+    };
+
+    document.getElementById("logout").onclick = () => {
+      sessionStorage.removeItem("id_token");
+      mostrarSesion(false);
+    };
+
+    document.getElementById("probar").onclick = async () => {
+      const token = sessionStorage.getItem("id_token");
+      const r = await fetch(cfg.apiUrl + "/api/info", {
+        headers: token ? { Authorization: "Bearer " + token } : {},
+      });
+      salida.textContent = JSON.stringify(await r.json(), null, 2);
+    };
+  </script>
+</body>
+</html>

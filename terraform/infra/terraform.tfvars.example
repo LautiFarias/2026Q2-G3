@@ -1,0 +1,27 @@
+project     = "accesoseguro"
+environment = "dev"
+region      = "us-east-1"
+vpc_cidr    = "10.0.0.0/16"
+
+# Tag de la imagen que ya subiste a ECR (nunca "latest").
+api_image_tag = "v1.0"
+
+db_name             = "accesoseguro"
+db_username         = "accesoseguro_admin"
+db_instance_class   = "db.t3.micro"
+db_allocated_storage = 20
+
+ecs_min_tasks  = 2
+ecs_max_tasks  = 4
+ecs_cpu_target = 50
+
+# SES en sandbox: completar con mails reales del equipo antes de aplicar.
+ses_verified_emails = ["responsable@ejemplo.com", "transportista@ejemplo.com"]
+alarm_email         = ""
+
+enable_cloudtrail = false
+
+tags = {
+  Materia = "82.08-cloud-computing"
+  Grupo   = "G3"
+}

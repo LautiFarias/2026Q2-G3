@@ -1,0 +1,217 @@
+name: Terraform CI/CD
+
+on:
+  pull_request:
+    paths:
+      - "terraform/**"
+      - "app/**"
+      - "lambdas/**"
+      - ".github/workflows/terraform.yml"
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Qué correr contra el Learner Lab"
+        required: true
+        default: apply
+        type: choice
+        options: [apply, destroy]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  TF_VERSION: "1.10.*"
+  AWS_REGION: "us-east-1"
+
+jobs:
+  # fmt + validate: no necesitan credenciales de AWS, corren siempre.
+  fmt-validate:
+    name: fmt + validate (${{ matrix.proyecto }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        proyecto: [bootstrap, infra]
+    defaults:
+      run:
+        working-directory: terraform/${{ matrix.proyecto }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform fmt -check
+        run: terraform fmt -check -recursive ..
+
+      - name: terraform init (sin backend remoto)
+        run: terraform init -backend=false -input=false
+
+      - name: terraform validate
+        run: terraform validate
+
+  # plan en cada PR: si están los secrets del lab y el bucket del state ya
+  # existe (lo crea el job "aplicar"), corre init+plan y comenta el resultado.
+  plan:
+    name: terraform plan (infra)
+    needs: fmt-validate
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      # El contexto "secrets" no se puede usar en el "if" de un step, pero sí
+      # en el env del job: acá lo convertimos en un flag.
+      HAY_SECRETS: ${{ secrets.AWS_ACCESS_KEY_ID != '' }}
+    defaults:
+      run:
+        working-directory: terraform/infra
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Credenciales del Learner Lab
+        if: env.HAY_SECRETS == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Buscar el bucket del state
+        if: env.HAY_SECRETS == 'true'
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET="accesoseguro-tfstate-${ACCOUNT}"
+          if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            echo "HAY_BUCKET=true" >> "$GITHUB_ENV"
+            cat > backend.hcl <<BACKEND
+          bucket       = "${BUCKET}"
+          key          = "accesoseguro/dev/terraform.tfstate"
+          region       = "${AWS_REGION}"
+          encrypt      = true
+          use_lockfile = true
+          BACKEND
+          else
+            echo "::warning::Todavía no existe el bucket del state (${BUCKET}). Corré el workflow manual 'apply' una vez."
+          fi
+
+      - name: terraform init + plan
+        if: env.HAY_SECRETS == 'true' && env.HAY_BUCKET == 'true'
+        run: |
+          terraform init -backend-config=backend.hcl
+          terraform plan -no-color -input=false | tee plan.txt
+
+      - name: Comentar el plan en el PR
+        if: env.HAY_SECRETS == 'true' && env.HAY_BUCKET == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('terraform/infra/plan.txt', 'utf8').slice(-60000);
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `#### Terraform Plan\n<details><summary>Ver plan</summary>\n\n\`\`\`\n${plan}\n\`\`\`\n</details>`
+            });
+
+      - name: Sin secrets o sin bucket, se omite init/plan
+        if: env.HAY_SECRETS != 'true' || env.HAY_BUCKET != 'true'
+        run: echo "::warning::Se omite init/plan (faltan secrets de AWS o el bucket del state). validate ya corrió."
+
+  # Despliegue manual (workflow_dispatch): las credenciales del Learner Lab son
+  # temporales, hay que cargarlas como secrets antes de correrlo.
+  aplicar:
+    name: terraform ${{ github.event.inputs.action }}
+    needs: fmt-validate
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # 1er Terraform: bucket del state (stack de CloudFormation, ver
+      # terraform/modules/s3-bucket). Su propio state es local y se pierde entre
+      # corridas: si el stack ya existe se importa antes de aplicar.
+      - name: bootstrap (bucket del state)
+        working-directory: terraform/bootstrap
+        run: |
+          BUCKET="accesoseguro-tfstate-$(aws sts get-caller-identity --query Account --output text)"
+          STACK="s3-${BUCKET}"
+          terraform init -input=false
+          if aws cloudformation describe-stacks --stack-name "$STACK" >/dev/null 2>&1; then
+            terraform import -input=false module.state_bucket.aws_cloudformation_stack.bucket "$STACK"
+          elif aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            # Bucket huérfano de un intento anterior (creado fuera de CloudFormation).
+            # Solo se borra si está vacío, para no perder un state.
+            if [ -z "$(aws s3api list-object-versions --bucket "$BUCKET" --max-items 1 --query 'length([Versions,DeleteMarkers][])' --output text | grep -v '^0$' || true)" ]; then
+              aws s3api delete-bucket --bucket "$BUCKET"
+            else
+              echo "::error::El bucket $BUCKET existe, tiene contenido y no lo creó este proyecto. Revisalo a mano."
+              exit 1
+            fi
+          fi
+          terraform apply -auto-approve -input=false
+
+      - name: init (backend remoto)
+        working-directory: terraform/infra
+        run: terraform init -backend-config=backend.hcl -input=false
+
+      - name: terraform apply
+        if: github.event.inputs.action == 'apply'
+        working-directory: terraform/infra
+        run: terraform apply -auto-approve -input=false
+
+      # La imagen de la API tiene que estar en ECR para que las tasks arranquen.
+      - name: build + push de la imagen a ECR
+        if: github.event.inputs.action == 'apply'
+        working-directory: terraform/infra
+        run: |
+          REPO_URL=$(terraform output -raw ecr_repository_url)
+          REPO_NAME="${REPO_URL##*/}"
+          TAG=$(terraform output -raw api_image_tag)
+          if aws ecr describe-images --repository-name "$REPO_NAME" --image-ids imageTag="$TAG" >/dev/null 2>&1; then
+            echo "La imagen $REPO_NAME:$TAG ya existe en ECR (tags inmutables): no se vuelve a subir."
+          else
+            aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "${REPO_URL%%/*}"
+            docker build -t "$REPO_URL:$TAG" ../../app
+            docker push "$REPO_URL:$TAG"
+          fi
+          aws ecs update-service --cluster "$(terraform output -raw ecs_cluster_name)" \
+            --service "$(terraform output -raw ecs_service_name)" --force-new-deployment --region "$AWS_REGION" >/dev/null
+
+      - name: mostrar URLs
+        if: github.event.inputs.action == 'apply'
+        working-directory: terraform/infra
+        run: |
+          echo "sitio_url: $(terraform output -raw sitio_url)"
+          echo "api_url:   $(terraform output -raw api_url)"
+          {
+            echo "### AccesoSeguro desplegado"
+            echo "- Sitio: $(terraform output -raw sitio_url)"
+            echo "- API: $(terraform output -raw api_url)/health"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: terraform destroy
+        if: github.event.inputs.action == 'destroy'
+        working-directory: terraform/infra
+        run: terraform destroy -auto-approve -input=false

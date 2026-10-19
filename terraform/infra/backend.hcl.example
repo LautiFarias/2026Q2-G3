@@ -1,0 +1,7 @@
+# Este archivo lo genera automáticamente terraform/bootstrap (local_file.backend_hcl).
+# Queda como ejemplo de referencia; backend.hcl real NO se versiona (.gitignore).
+bucket       = "accesoseguro-tfstate-<account_id>"
+key          = "accesoseguro/dev/terraform.tfstate"
+region       = "us-east-1"
+encrypt      = true
+use_lockfile = true
